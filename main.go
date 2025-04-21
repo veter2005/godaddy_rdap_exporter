@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -12,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/openrdap/rdap"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -52,45 +52,42 @@ func main() {
 	flag.Parse()
 
 	if *flagVersion {
-		fmt.Println(version) //nolint:forbidigo
+		fmt.Println(version)
 		os.Exit(1)
 	}
 
 	log.Printf("starting rdap_exporter (%s)", version)
 
-	// read and verify config file
 	if *flagDomainFile == "" {
 		log.Fatalf("no -domain-file specified")
 	}
+
 	domains, err := readDomainFile(*flagDomainFile)
 	if err != nil {
 		log.Fatalf("error getting domains %q: %v", *flagDomainFile, err)
 	}
 	if !*flagQuiet {
-		for i := range domains {
-			log.Printf("INFO monitoring %s", domains[i])
+		for _, d := range domains {
+			log.Printf("INFO monitoring %s", d)
 		}
 	}
 
-	// Setup internal checker
 	check := &checker{
-		domains:  domains,
-		handler:  domainExpiration,
-		client:   &rdap.Client{},
-		interval: *flagInterval,
+		domains:    domains,
+		handler:    domainExpiration,
+		httpClient: &http.Client{Timeout: 10 * time.Second},
+		interval:   *flagInterval,
 	}
+
 	go check.checkAll()
 
-	// Add domain_expiration to /metrics
-	h := promhttp.HandlerFor(prometheus.DefaultGatherer, promhttp.HandlerOpts{})
-	http.Handle("/metrics", h)
+	http.Handle("/metrics", promhttp.Handler())
 
-	log.Printf("listenting on %s", *flagAddress)
+	log.Printf("listening on %s", *flagAddress)
 
-	// Create server with timeout configurations
 	server := &http.Server{
 		Addr:              *flagAddress,
-		Handler:           nil, // Uses DefaultServeMux
+		Handler:           nil,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       30 * time.Second,
@@ -103,19 +100,17 @@ func main() {
 }
 
 type checker struct {
-	domains []string
-	handler *prometheus.GaugeVec
-
-	client *rdap.Client
-
-	t        *time.Ticker
-	interval time.Duration
+	domains    []string
+	handler    *prometheus.GaugeVec
+	httpClient *http.Client
+	t          *time.Ticker
+	interval   time.Duration
 }
 
 func (c *checker) checkAll() {
 	if c.t == nil {
 		c.t = time.NewTicker(c.interval)
-		c.checkNow() // check domains right away after ticker setup
+		c.checkNow()
 	}
 	for range c.t.C {
 		c.checkNow()
@@ -123,45 +118,55 @@ func (c *checker) checkAll() {
 }
 
 func (c *checker) checkNow() {
-	for i := range c.domains {
-		expr, err := c.getExpiration(c.domains[i])
+	for _, domain := range c.domains {
+		expiration, err := c.getExpiration(domain)
 		if err != nil {
-			log.Printf("error getting RDAP expiration for %s: %v", c.domains[i], err)
-			// Present an invalid value
-			c.handler.WithLabelValues(c.domains[i]).Set(0)
+			log.Printf("error getting RDAP expiration for %s: %v", domain, err)
+			c.handler.WithLabelValues(domain).Set(0)
 			continue
 		}
-		days := math.Floor(time.Until(*expr).Hours() / 24)
-		c.handler.WithLabelValues(c.domains[i]).Set(days)
-		log.Printf("%s expires in %.2f days", c.domains[i], days)
+		days := math.Floor(time.Until(*expiration).Hours() / 24)
+		c.handler.WithLabelValues(domain).Set(days)
+		log.Printf("%s expires in %.2f days", domain, days)
 	}
 }
 
-func (c *checker) getExpiration(d string) (*time.Time, error) {
-	req := &rdap.Request{
-		Type:  rdap.DomainRequest,
-		Query: d,
-	}
-	resp, err := c.client.Do(req)
+func (c *checker) getExpiration(domain string) (*time.Time, error) {
+	url := fmt.Sprintf("https://rdap.godaddy.com/v1/domain/%s", domain)
 
-	domain, ok := resp.Object.(*rdap.Domain)
-	if !ok {
-		return nil, fmt.Errorf("unable to read domain response: %v", err)
+	resp, err := c.httpClient.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("error querying RDAP: %v", err)
 	}
-	for i := range domain.Events {
-		event := domain.Events[i]
-		if event.Action == "expiration" {
-			for j := range defaultDateFormats {
-				when, err := time.Parse(defaultDateFormats[j], event.Date)
-				if err != nil {
-					continue
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected HTTP status: %s", resp.Status)
+	}
+
+	var result struct {
+		Events []struct {
+			EventAction string `json:"eventAction"`
+			EventDate   string `json:"eventDate"`
+		} `json:"events"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("error decoding response: %v", err)
+	}
+
+	for _, event := range result.Events {
+		if event.EventAction == "expiration" {
+			for _, format := range defaultDateFormats {
+				if t, err := time.Parse(format, event.EventDate); err == nil {
+					return &t, nil
 				}
-				return &when, nil
 			}
-			return nil, fmt.Errorf("unable to find parsable format for %q", event.Date)
+			return nil, fmt.Errorf("couldn't parse expiration date: %q", event.EventDate)
 		}
 	}
-	return nil, err
+
+	return nil, fmt.Errorf("no expiration event found")
 }
 
 func readDomainFile(where string) ([]string, error) {
@@ -175,12 +180,19 @@ func readDomainFile(where string) ([]string, error) {
 		return nil, fmt.Errorf("when opening %s: %v", fullPath, err)
 	}
 	defer fd.Close()
-	r := bufio.NewScanner(fd)
 
+	scanner := bufio.NewScanner(fd)
 	var domains []string
-	for r.Scan() {
-		domains = append(domains, strings.TrimSpace(r.Text()))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" {
+			domains = append(domains, line)
+		}
 	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("reading domain file: %v", err)
+	}
+
 	if len(domains) == 0 {
 		return nil, fmt.Errorf("no domains found in %s", fullPath)
 	}
